@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp templates/decision-template.md /tmp/t1.md)",
+      "Bash(mkdir -p /tmp/sedtest)",
+      "Bash(cp templates/decision-template.md /tmp/sedtest/t1.md)",
+      "Bash(sed \"s/ADR-000: <Title>/ADR-001: Use Redis\\\\/Memcached for caching/\" /tmp/sedtest/t1.md)",
+      "Bash(chmod +x scripts/create-new-adr.sh)",
+      "Bash(./scripts/create-new-adr.sh --json \"Use Redis/Memcached for caching\")",
+      "Bash(./scripts/create-new-adr.sh --json \"Build & deploy pipeline\")",
+      "Bash(./scripts/create-new-adr.sh --json 'Use \"Redis\" C:\\\\1 for cache')",
+      "Bash(python3 -c *)"
+    ]
+  }
+}

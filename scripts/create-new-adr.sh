@@ -65,19 +65,26 @@ SLUG=$(echo "$ADR_TITLE" | \
 
 ADR_FILE="$ADR_DIR/ADR-${ADR_NUM}-${SLUG}.md"
 
-# Copy template if it exists and fill in number/title
+# Copy template if it exists and fill in number/title.
+# Rewritten structurally (replace line 1 outright) rather than via sed
+# pattern/replacement, since ADR_TITLE is free text and may contain
+# characters (/, &, \1) that are meaningful to sed's s/// syntax.
 TEMPLATE="$REPO_ROOT/templates/decision-template.md"
 
 if [ -f "$TEMPLATE" ]; then
-    sed "s/ADR-000: <Title>/ADR-${ADR_NUM}: ${ADR_TITLE}/" "$TEMPLATE" > "$ADR_FILE"
+    { printf '# ADR-%s: %s\n' "$ADR_NUM" "$ADR_TITLE"; tail -n +2 "$TEMPLATE"; } > "$ADR_FILE"
 else
     echo "Warning: Template not found at $TEMPLATE" >&2
     printf '# ADR-%s: %s\n' "$ADR_NUM" "$ADR_TITLE" > "$ADR_FILE"
 fi
 
+json_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
 if $JSON_MODE; then
     printf '{"ADR_NUM":"%s","ADR_FILE":"%s","ADR_DIR":"%s","ADR_TITLE":"%s"}\n' \
-        "$ADR_NUM" "$ADR_FILE" "$ADR_DIR" "$ADR_TITLE"
+        "$(json_escape "$ADR_NUM")" "$(json_escape "$ADR_FILE")" "$(json_escape "$ADR_DIR")" "$(json_escape "$ADR_TITLE")"
 else
     # Output results for the LLM to use (legacy key: value format)
     echo "ADR_NUM: $ADR_NUM"

@@ -127,6 +127,14 @@ jobs:
         cp -r sdd-package-base/* sdd-claude-package/
         mkdir -p sdd-claude-package/.claude/commands
         generate_commands "claude" "md" "\$ARGUMENTS" "sdd-claude-package/.claude/commands"
+        # Skills (e.g. templates/commands/skills/adr) are a Claude Code-only
+        # concept, not covered by generate_commands, and not copied by the
+        # templates copy above (which excludes templates/commands entirely).
+        if [ -d "templates/commands/skills" ]; then
+          mkdir -p sdd-claude-package/.claude/skills
+          cp -r templates/commands/skills/* sdd-claude-package/.claude/skills/
+          echo "Copied Claude Code skills"
+        fi
         echo "Created Claude Code package"
         
         # Create Gemini CLI package  

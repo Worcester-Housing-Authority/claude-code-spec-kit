@@ -6,7 +6,9 @@
 #     "rich",
 #     "platformdirs",
 #     "readchar",
-#     "httpx",
+#     "json5",
+#     "pyyaml",
+#     "packaging",
 # ]
 # ///
 """
@@ -14,266 +16,75 @@ Specify CLI - Setup tool for Specify projects
 
 Usage:
     uvx specify-cli.py init <project-name>
+    uvx specify-cli.py init .
     uvx specify-cli.py init --here
 
 Or install globally:
     uv tool install --from specify-cli.py specify-cli
     specify init <project-name>
+    specify init .
     specify init --here
 """
 
 import os
-import subprocess
 import sys
-import zipfile
-import tempfile
-import shutil
 import json
 from pathlib import Path
-from typing import Optional
 
 import typer
-import httpx
-from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.text import Text
-from rich.live import Live
 from rich.align import Align
 from rich.table import Table
-from rich.tree import Tree
-from typer.core import TyperGroup
+from .shared_infra import (
+    install_shared_infra as _install_shared_infra_impl,
+    refresh_shared_templates as _refresh_shared_templates_impl,
+)
 
-# For cross-platform keyboard input
-import readchar
-
-# Constants
-AI_CHOICES = {
-    "copilot": "GitHub Copilot",
-    "claude": "Claude Code",
-    "gemini": "Gemini CLI"
-}
-
-# ASCII Art Banner
-BANNER = """
-███████╗██████╗ ███████╗ ██████╗██╗███████╗██╗   ██╗
-██╔════╝██╔══██╗██╔════╝██╔════╝██║██╔════╝╚██╗ ██╔╝
-███████╗██████╔╝█████╗  ██║     ██║█████╗   ╚████╔╝ 
-╚════██║██╔═══╝ ██╔══╝  ██║     ██║██╔══╝    ╚██╔╝  
-███████║██║     ███████╗╚██████╗██║██║        ██║   
-╚══════╝╚═╝     ╚══════╝ ╚═════╝╚═╝╚═╝        ╚═╝   
-"""
-
-TAGLINE = "Spec-Driven Development Toolkit"
-class StepTracker:
-    """Track and render hierarchical steps without emojis, similar to Claude Code tree output.
-    Supports live auto-refresh via an attached refresh callback.
-    """
-    def __init__(self, title: str):
-        self.title = title
-        self.steps = []  # list of dicts: {key, label, status, detail}
-        self.status_order = {"pending": 0, "running": 1, "done": 2, "error": 3, "skipped": 4}
-        self._refresh_cb = None  # callable to trigger UI refresh
-
-    def attach_refresh(self, cb):
-        self._refresh_cb = cb
-
-    def add(self, key: str, label: str):
-        if key not in [s["key"] for s in self.steps]:
-            self.steps.append({"key": key, "label": label, "status": "pending", "detail": ""})
-            self._maybe_refresh()
-
-    def start(self, key: str, detail: str = ""):
-        self._update(key, status="running", detail=detail)
-
-    def complete(self, key: str, detail: str = ""):
-        self._update(key, status="done", detail=detail)
-
-    def error(self, key: str, detail: str = ""):
-        self._update(key, status="error", detail=detail)
-
-    def skip(self, key: str, detail: str = ""):
-        self._update(key, status="skipped", detail=detail)
-
-    def _update(self, key: str, status: str, detail: str):
-        for s in self.steps:
-            if s["key"] == key:
-                s["status"] = status
-                if detail:
-                    s["detail"] = detail
-                self._maybe_refresh()
-                return
-        # If not present, add it
-        self.steps.append({"key": key, "label": key, "status": status, "detail": detail})
-        self._maybe_refresh()
-
-    def _maybe_refresh(self):
-        if self._refresh_cb:
-            try:
-                self._refresh_cb()
-            except Exception:
-                pass
-
-    def render(self):
-        tree = Tree(f"[bold cyan]{self.title}[/bold cyan]", guide_style="grey50")
-        for step in self.steps:
-            label = step["label"]
-            detail_text = step["detail"].strip() if step["detail"] else ""
-
-            # Circles (unchanged styling)
-            status = step["status"]
-            if status == "done":
-                symbol = "[green]●[/green]"
-            elif status == "pending":
-                symbol = "[green dim]○[/green dim]"
-            elif status == "running":
-                symbol = "[cyan]○[/cyan]"
-            elif status == "error":
-                symbol = "[red]●[/red]"
-            elif status == "skipped":
-                symbol = "[yellow]○[/yellow]"
-            else:
-                symbol = " "
-
-            if status == "pending":
-                # Entire line light gray (pending)
-                if detail_text:
-                    line = f"{symbol} [bright_black]{label} ({detail_text})[/bright_black]"
-                else:
-                    line = f"{symbol} [bright_black]{label}[/bright_black]"
-            else:
-                # Label white, detail (if any) light gray in parentheses
-                if detail_text:
-                    line = f"{symbol} [white]{label}[/white] [bright_black]({detail_text})[/bright_black]"
-                else:
-                    line = f"{symbol} [white]{label}[/white]"
-
-            tree.add(line)
-        return tree
-
-
-
-MINI_BANNER = """
-╔═╗╔═╗╔═╗╔═╗╦╔═╗╦ ╦
-╚═╗╠═╝║╣ ║  ║╠╣ ╚╦╝
-╚═╝╩  ╚═╝╚═╝╩╚   ╩ 
-"""
-
-def get_key():
-    """Get a single keypress in a cross-platform way using readchar."""
-    key = readchar.readkey()
-    
-    # Arrow keys
-    if key == readchar.key.UP:
-        return 'up'
-    if key == readchar.key.DOWN:
-        return 'down'
-    
-    # Enter/Return
-    if key == readchar.key.ENTER:
-        return 'enter'
-    
-    # Escape
-    if key == readchar.key.ESC:
-        return 'escape'
-        
-    # Ctrl+C
-    if key == readchar.key.CTRL_C:
-        raise KeyboardInterrupt
-
-    return key
-
-
-
-def select_with_arrows(options: dict, prompt_text: str = "Select an option", default_key: str = None) -> str:
-    """
-    Interactive selection using arrow keys with Rich Live display.
-    
-    Args:
-        options: Dict with keys as option keys and values as descriptions
-        prompt_text: Text to show above the options
-        default_key: Default option key to start with
-        
-    Returns:
-        Selected option key
-    """
-    option_keys = list(options.keys())
-    if default_key and default_key in option_keys:
-        selected_index = option_keys.index(default_key)
-    else:
-        selected_index = 0
-    
-    selected_key = None
-
-    def create_selection_panel():
-        """Create the selection panel with current selection highlighted."""
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bright_cyan", justify="left", width=3)
-        table.add_column(style="white", justify="left")
-        
-        for i, key in enumerate(option_keys):
-            if i == selected_index:
-                table.add_row("▶", f"[bright_cyan]{key}: {options[key]}[/bright_cyan]")
-            else:
-                table.add_row(" ", f"[white]{key}: {options[key]}[/white]")
-        
-        table.add_row("", "")
-        table.add_row("", "[dim]Use ↑/↓ to navigate, Enter to select, Esc to cancel[/dim]")
-        
-        return Panel(
-            table,
-            title=f"[bold]{prompt_text}[/bold]",
-            border_style="cyan",
-            padding=(1, 2)
-        )
-    
-    console.print()
-
-    def run_selection_loop():
-        nonlocal selected_key, selected_index
-        with Live(create_selection_panel(), console=console, transient=True, auto_refresh=False) as live:
-            while True:
-                try:
-                    key = get_key()
-                    if key == 'up':
-                        selected_index = (selected_index - 1) % len(option_keys)
-                    elif key == 'down':
-                        selected_index = (selected_index + 1) % len(option_keys)
-                    elif key == 'enter':
-                        selected_key = option_keys[selected_index]
-                        break
-                    elif key == 'escape':
-                        console.print("\n[yellow]Selection cancelled[/yellow]")
-                        raise typer.Exit(1)
-                    
-                    live.update(create_selection_panel(), refresh=True)
-
-                except KeyboardInterrupt:
-                    console.print("\n[yellow]Selection cancelled[/yellow]")
-                    raise typer.Exit(1)
-
-    run_selection_loop()
-
-    if selected_key is None:
-        console.print("\n[red]Selection failed.[/red]")
-        raise typer.Exit(1)
-
-    # Suppress explicit selection print; tracker / later logic will report consolidated status
-    return selected_key
-
-
-
-console = Console()
-
-
-class BannerGroup(TyperGroup):
-    """Custom group that shows banner before help."""
-    
-    def format_help(self, ctx, formatter):
-        # Show banner before help
-        show_banner()
-        super().format_help(ctx, formatter)
-
+from ._console import (
+    BANNER as BANNER,
+    TAGLINE as TAGLINE,
+    BannerGroup,
+    StepTracker,
+    console,
+    err_console,
+    get_key as get_key,
+    select_with_arrows as select_with_arrows,
+    show_banner,
+)
+from ._assets import (
+    _locate_bundled_extension as _locate_bundled_extension,
+    _locate_bundled_preset as _locate_bundled_preset,
+    _locate_bundled_workflow as _locate_bundled_workflow,
+    _locate_core_pack,
+    _repo_root,
+    get_speckit_version as get_speckit_version,
+)
+from ._utils import (
+    CLAUDE_LOCAL_PATH as CLAUDE_LOCAL_PATH,
+    CLAUDE_NPM_LOCAL_PATH as CLAUDE_NPM_LOCAL_PATH,
+    _display_project_path,
+    check_tool as check_tool,
+    handle_vscode_settings as handle_vscode_settings,
+    merge_json_files as merge_json_files,
+    run_command as run_command,
+)
+from ._version import (
+    GITHUB_API_LATEST as GITHUB_API_LATEST,
+    self_app as _self_app,
+    self_check as self_check,
+    self_upgrade as self_upgrade,
+)
+from ._agent_config import (
+    AGENT_CONFIG as AGENT_CONFIG,
+    DEFAULT_INIT_INTEGRATION as DEFAULT_INIT_INTEGRATION,
+    SCRIPT_TYPE_CHOICES as SCRIPT_TYPE_CHOICES,
+)
+from ._init_options import (
+    INIT_OPTIONS_FILE as INIT_OPTIONS_FILE,
+    is_ai_skills_enabled as _is_ai_skills_enabled,
+    load_init_options as load_init_options,
+    save_init_options as save_init_options,
+)
 
 app = typer.Typer(
     name="specify",
@@ -283,589 +94,495 @@ app = typer.Typer(
     cls=BannerGroup,
 )
 
-
-def show_banner():
-    """Display the ASCII art banner."""
-    # Create gradient effect with different colors
-    banner_lines = BANNER.strip().split('\n')
-    colors = ["bright_blue", "blue", "cyan", "bright_cyan", "white", "bright_white"]
-    
-    styled_banner = Text()
-    for i, line in enumerate(banner_lines):
-        color = colors[i % len(colors)]
-        styled_banner.append(line + "\n", style=color)
-    
-    console.print(Align.center(styled_banner))
-    console.print(Align.center(Text(TAGLINE, style="italic bright_yellow")))
-    console.print()
-
+def _version_callback(value: bool):
+    if value:
+        console.print(f"specify {get_speckit_version()}")
+        raise typer.Exit()
 
 @app.callback()
-def callback(ctx: typer.Context):
+def callback(
+    ctx: typer.Context,
+    version: bool = typer.Option(False, "--version", "-V", callback=_version_callback, is_eager=True, help="Show version and exit."),
+):
     """Show banner when no subcommand is provided."""
-    # Show banner only when no subcommand and no help flag
-    # (help is handled by BannerGroup)
     if ctx.invoked_subcommand is None and "--help" not in sys.argv and "-h" not in sys.argv:
         show_banner()
         console.print(Align.center("[dim]Run 'specify --help' for usage information[/dim]"))
         console.print()
 
+def _refresh_shared_templates(
+    project_path: Path,
+    *,
+    invoke_separator: str,
+    force: bool = False,
+) -> None:
+    """Refresh default-sensitive shared templates without touching scripts."""
+    _refresh_shared_templates_impl(
+        project_path,
+        version=get_speckit_version(),
+        core_pack=_locate_core_pack(),
+        repo_root=_repo_root(),
+        console=console,
+        invoke_separator=invoke_separator,
+        force=force,
+    )
 
-def run_command(cmd: list[str], check_return: bool = True, capture: bool = False, shell: bool = False) -> Optional[str]:
-    """Run a shell command and optionally capture output."""
+
+def _install_shared_infra(
+    project_path: Path,
+    script_type: str,
+    tracker: StepTracker | None = None,
+    force: bool = False,
+    invoke_separator: str = ".",
+    refresh_managed: bool = False,
+    refresh_hint: str | None = None,
+) -> bool:
+    """Install shared infrastructure files into *project_path*.
+
+    Copies ``.specify/scripts/<variant>/`` and ``.specify/templates/`` from
+    the bundled core_pack or source checkout. ``sh`` installs Bash, ``ps``
+    installs PowerShell, and ``py`` installs Python plus the platform shell
+    fallback. Tracks all installed files in ``speckit.manifest.json``.
+
+    Shared scripts and page templates are processed to resolve
+    ``__SPECKIT_COMMAND_<NAME>__`` placeholders using *invoke_separator*
+    (``"."`` for markdown agents, ``"-"`` for skills agents).
+
+    Overwrite policy:
+
+    * ``force=True``  — overwrite every existing file (still skips symlinks
+      to avoid following links outside the project root).
+    * ``refresh_managed=True`` — overwrite only files whose on-disk hash
+      still matches the previously recorded manifest hash (i.e. unmodified
+      files installed by spec-kit). Files with diverging hashes are
+      treated as user customizations and preserved with a warning.
+    * Default — only add missing files; existing ones are skipped.
+
+    *refresh_hint* — caller-supplied rich-text fragment shown after the
+    "Preserved customized files" warning to tell the user which flag/command
+    they should re-run with to overwrite their customizations. Each caller
+    passes the flag that's actually valid in its CLI surface (e.g.
+    ``--refresh-shared-infra`` for ``integration switch``,
+    ``--force`` for ``init``/``integration upgrade``). When ``None``, no
+    remediation hint is printed for customizations.
+
+    Returns ``True`` on success.
+    """
+    return _install_shared_infra_impl(
+        project_path,
+        script_type,
+        version=get_speckit_version(),
+        core_pack=_locate_core_pack(),
+        repo_root=_repo_root(),
+        console=console,
+        force=force,
+        invoke_separator=invoke_separator,
+        refresh_managed=refresh_managed,
+        refresh_hint=refresh_hint,
+    )
+
+
+def _install_shared_infra_or_exit(
+    project_path: Path,
+    script_type: str,
+    tracker: StepTracker | None = None,
+    force: bool = False,
+    invoke_separator: str = ".",
+    refresh_managed: bool = False,
+    refresh_hint: str | None = None,
+) -> bool:
     try:
-        if capture:
-            result = subprocess.run(cmd, check=check_return, capture_output=True, text=True, shell=shell)
-            return result.stdout.strip()
-        else:
-            subprocess.run(cmd, check=check_return, shell=shell)
-            return None
-    except subprocess.CalledProcessError as e:
-        if check_return:
-            console.print(f"[red]Error running command:[/red] {' '.join(cmd)}")
-            console.print(f"[red]Exit code:[/red] {e.returncode}")
-            if hasattr(e, 'stderr') and e.stderr:
-                console.print(f"[red]Error output:[/red] {e.stderr}")
-            raise
+        return _install_shared_infra(
+            project_path,
+            script_type,
+            tracker=tracker,
+            force=force,
+            invoke_separator=invoke_separator,
+            refresh_managed=refresh_managed,
+            refresh_hint=refresh_hint,
+        )
+    except (ValueError, OSError) as exc:
+        console.print(f"[red]Error:[/red] Failed to install shared infrastructure: {exc}")
+        raise typer.Exit(1)
+
+
+def ensure_executable_scripts(project_path: Path, tracker: StepTracker | None = None) -> None:
+    """Ensure POSIX .sh scripts under .specify/scripts and .specify/extensions (recursively) have execute bits (no-op on Windows)."""
+    if os.name == "nt":
+        return  # Windows: skip silently
+    scan_roots = [
+        project_path / ".specify" / "scripts",
+        project_path / ".specify" / "extensions",
+    ]
+    failures: list[str] = []
+    updated = 0
+    for scripts_root in scan_roots:
+        if not scripts_root.is_dir():
+            continue
+        for script in scripts_root.rglob("*.sh"):
+            try:
+                if script.is_symlink() or not script.is_file():
+                    continue
+                try:
+                    with script.open("rb") as f:
+                        if f.read(2) != b"#!":
+                            continue
+                except Exception:
+                    continue
+                st = script.stat()
+                mode = st.st_mode
+                if mode & 0o111:
+                    continue
+                new_mode = mode
+                if mode & 0o400:
+                    new_mode |= 0o100
+                if mode & 0o040:
+                    new_mode |= 0o010
+                if mode & 0o004:
+                    new_mode |= 0o001
+                if not (new_mode & 0o100):
+                    new_mode |= 0o100
+                os.chmod(script, new_mode)
+                updated += 1
+            except Exception as e:
+                failures.append(f"{_display_project_path(project_path, script)}: {e}")
+    if tracker:
+        detail = f"{updated} updated" + (f", {len(failures)} failed" if failures else "")
+        tracker.add("chmod", "Set script permissions recursively")
+        (tracker.error if failures else tracker.complete)("chmod", detail)
+    else:
+        if updated:
+            console.print(f"[cyan]Updated execute permissions on {updated} script(s) recursively[/cyan]")
+        if failures:
+            console.print("[yellow]Some scripts could not be updated:[/yellow]")
+            for f in failures:
+                console.print(f"  - {f}")
+
+# ---------------------------------------------------------------------------
+# Skills directory helpers
+# ---------------------------------------------------------------------------
+
+def _get_skills_dir(project_path: Path, selected_ai: str) -> Path:
+    """Resolve the agent-specific skills directory.
+
+    Returns ``project_path / <agent_folder> / "skills"``, falling back
+    to ``project_path / ".agents/skills"`` for unknown agents.
+    """
+    agent_config = AGENT_CONFIG.get(selected_ai, {})
+    agent_folder = agent_config.get("folder", "")
+    if agent_folder:
+        return project_path / agent_folder.rstrip("/") / "skills"
+    return project_path / ".agents" / "skills"
+
+
+def resolve_active_skills_dir(project_root: Path) -> Path | None:
+    """Return the active skills directory, creating it on demand when enabled.
+
+    Reads ``.specify/init-options.json`` to determine whether skills are
+    enabled and which agent was selected.  Only ``ai_skills`` set to boolean
+    ``True`` creates the directory safely (symlink/containment checks); when
+    ``ai_skills`` is not boolean ``True``, only Kimi's native-skills fallback
+    is honoured, and the native skills directory must already exist.
+
+    Returns:
+        The skills directory ``Path``, or ``None`` if skills are not active.
+
+    Raises:
+        ValueError: If the resolved skills path escapes the project root,
+            a parent component is a symlink, or a path component exists
+            but is not a directory.
+        OSError: If the directory cannot be created (e.g. permission denied).
+    """
+    from .shared_infra import _ensure_safe_shared_directory
+
+    opts = load_init_options(project_root)
+    if not isinstance(opts, dict):
+        opts = {}
+
+    agent = opts.get("ai")
+    if not isinstance(agent, str) or not agent:
         return None
 
+    ai_skills_enabled = _is_ai_skills_enabled(opts)
+    if not ai_skills_enabled and agent != "kimi":
+        return None
 
-def check_tool(tool: str, install_hint: str) -> bool:
-    """Check if a tool is installed."""
-    if shutil.which(tool):
-        return True
-    else:
-        console.print(f"[yellow]⚠️  {tool} not found[/yellow]")
-        console.print(f"   Install with: [cyan]{install_hint}[/cyan]")
-        return False
+    skills_dir = _get_skills_dir(project_root, agent)
 
-
-def is_git_repo(path: Path = None) -> bool:
-    """Check if the specified path is inside a git repository."""
-    if path is None:
-        path = Path.cwd()
-    
-    if not path.is_dir():
-        return False
-
-    try:
-        # Use git command to check if inside a work tree
-        subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            check=True,
-            capture_output=True,
-            cwd=path,
+    if not ai_skills_enabled:
+        # Kimi native-skills fallback when ai_skills is not boolean True:
+        # use the native skills directory only if it already exists.
+        if not skills_dir.is_dir():
+            return None
+        _ensure_safe_shared_directory(
+            project_root, skills_dir,
+            create=False, context="agent skills directory",
         )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+        return skills_dir
+
+    # ai_skills is boolean True: create the directory safely.
+    _ensure_safe_shared_directory(
+        project_root, skills_dir, context="agent skills directory",
+    )
+    return skills_dir
 
 
-def init_git_repo(project_path: Path, quiet: bool = False) -> bool:
-    """Initialize a git repository in the specified path.
-    quiet: if True suppress console output (tracker handles status)
-    """
-    try:
-        original_cwd = Path.cwd()
-        os.chdir(project_path)
-        if not quiet:
-            console.print("[cyan]Initializing git repository...[/cyan]")
-        subprocess.run(["git", "init"], check=True, capture_output=True)
-        subprocess.run(["git", "add", "."], check=True, capture_output=True)
-        subprocess.run(["git", "commit", "-m", "Initial commit from Specify template"], check=True, capture_output=True)
-        if not quiet:
-            console.print("[green]✓[/green] Git repository initialized")
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        if not quiet:
-            console.print(f"[red]Error initializing git repository:[/red] {e}")
-        return False
-    finally:
-        os.chdir(original_cwd)
+def _cli_error_detail(exc: BaseException) -> str:
+    """Return a compact one-line exception detail for CLI output."""
+    detail = str(exc).replace("\n", " ").strip()
+    return detail or exc.__class__.__name__
 
 
-def download_template_from_github(ai_assistant: str, download_dir: Path, *, verbose: bool = True, show_progress: bool = True):
-    """Download the latest template release from GitHub using HTTP requests.
-    Returns (zip_path, metadata_dict)
-    """
-    repo_owner = "github"
-    repo_name = "spec-kit"
-    
-    if verbose:
-        console.print("[cyan]Fetching latest release information...[/cyan]")
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-    
-    try:
-        response = httpx.get(api_url, timeout=30, follow_redirects=True)
-        response.raise_for_status()
-        release_data = response.json()
-    except httpx.RequestError as e:
-        if verbose:
-            console.print(f"[red]Error fetching release information:[/red] {e}")
-        raise typer.Exit(1)
-    
-    # Find the template asset for the specified AI assistant
-    pattern = f"spec-kit-template-{ai_assistant}"
-    matching_assets = [
-        asset for asset in release_data.get("assets", [])
-        if pattern in asset["name"] and asset["name"].endswith(".zip")
-    ]
-    
-    if not matching_assets:
-        if verbose:
-            console.print(f"[red]Error:[/red] No template found for AI assistant '{ai_assistant}'")
-            console.print(f"[yellow]Available assets:[/yellow]")
-            for asset in release_data.get("assets", []):
-                console.print(f"  - {asset['name']}")
-        raise typer.Exit(1)
-    
-    # Use the first matching asset
-    asset = matching_assets[0]
-    download_url = asset["browser_download_url"]
-    filename = asset["name"]
-    file_size = asset["size"]
-    
-    if verbose:
-        console.print(f"[cyan]Found template:[/cyan] {filename}")
-        console.print(f"[cyan]Size:[/cyan] {file_size:,} bytes")
-        console.print(f"[cyan]Release:[/cyan] {release_data['tag_name']}")
-    
-    # Download the file
-    zip_path = download_dir / filename
-    if verbose:
-        console.print(f"[cyan]Downloading template...[/cyan]")
-    
-    try:
-        with httpx.stream("GET", download_url, timeout=30, follow_redirects=True) as response:
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            
-            with open(zip_path, 'wb') as f:
-                if total_size == 0:
-                    # No content-length header, download without progress
-                    for chunk in response.iter_bytes(chunk_size=8192):
-                        f.write(chunk)
-                else:
-                    if show_progress:
-                        # Show progress bar
-                        with Progress(
-                            SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                            console=console,
-                        ) as progress:
-                            task = progress.add_task("Downloading...", total=total_size)
-                            downloaded = 0
-                            for chunk in response.iter_bytes(chunk_size=8192):
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                progress.update(task, completed=downloaded)
-                    else:
-                        # Silent download loop
-                        for chunk in response.iter_bytes(chunk_size=8192):
-                            f.write(chunk)
-    
-    except httpx.RequestError as e:
-        if verbose:
-            console.print(f"[red]Error downloading template:[/red] {e}")
-        if zip_path.exists():
-            zip_path.unlink()
-        raise typer.Exit(1)
-    if verbose:
-        console.print(f"Downloaded: {filename}")
-    metadata = {
-        "filename": filename,
-        "size": file_size,
-        "release": release_data["tag_name"],
-        "asset_url": download_url
-    }
-    return zip_path, metadata
+def _cli_phase_label(phase: str, target_kind: str, target: str | None = None) -> str:
+    """Format a stable operation label for user-visible diagnostics."""
+    label = f"{phase} {target_kind}".strip()
+    if target:
+        label = f"{label} '{target}'"
+    return label
 
 
-def download_and_extract_template(project_path: Path, ai_assistant: str, is_current_dir: bool = False, *, verbose: bool = True, tracker: StepTracker | None = None) -> Path:
-    """Download the latest release and extract it to create a new project.
-    Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup)
-    """
-    current_dir = Path.cwd()
-    
-    # Step: fetch + download combined
-    if tracker:
-        tracker.start("fetch", "contacting GitHub API")
-    try:
-        zip_path, meta = download_template_from_github(
-            ai_assistant,
-            current_dir,
-            verbose=verbose and tracker is None,
-            show_progress=(tracker is None)
-        )
-        if tracker:
-            tracker.complete("fetch", f"release {meta['release']} ({meta['size']:,} bytes)")
-            tracker.add("download", "Download template")
-            tracker.complete("download", meta['filename'])  # already downloaded inside helper
-    except Exception as e:
-        if tracker:
-            tracker.error("fetch", str(e))
-        else:
-            if verbose:
-                console.print(f"[red]Error downloading template:[/red] {e}")
-        raise
-    
-    if tracker:
-        tracker.add("extract", "Extract template")
-        tracker.start("extract")
-    elif verbose:
-        console.print("Extracting template...")
-    
-    try:
-        # Create project directory only if not using current directory
-        if not is_current_dir:
-            project_path.mkdir(parents=True)
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # List all files in the ZIP for debugging
-            zip_contents = zip_ref.namelist()
-            if tracker:
-                tracker.start("zip-list")
-                tracker.complete("zip-list", f"{len(zip_contents)} entries")
-            elif verbose:
-                console.print(f"[cyan]ZIP contains {len(zip_contents)} items[/cyan]")
-            
-            # For current directory, extract to a temp location first
-            if is_current_dir:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_path = Path(temp_dir)
-                    zip_ref.extractall(temp_path)
-                    
-                    # Check what was extracted
-                    extracted_items = list(temp_path.iterdir())
-                    if tracker:
-                        tracker.start("extracted-summary")
-                        tracker.complete("extracted-summary", f"temp {len(extracted_items)} items")
-                    elif verbose:
-                        console.print(f"[cyan]Extracted {len(extracted_items)} items to temp location[/cyan]")
-                    
-                    # Handle GitHub-style ZIP with a single root directory
-                    source_dir = temp_path
-                    if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                        source_dir = extracted_items[0]
-                        if tracker:
-                            tracker.add("flatten", "Flatten nested directory")
-                            tracker.complete("flatten")
-                        elif verbose:
-                            console.print(f"[cyan]Found nested directory structure[/cyan]")
-                    
-                    # Copy contents to current directory
-                    for item in source_dir.iterdir():
-                        dest_path = project_path / item.name
-                        if item.is_dir():
-                            if dest_path.exists():
-                                if verbose and not tracker:
-                                    console.print(f"[yellow]Merging directory:[/yellow] {item.name}")
-                                # Recursively copy directory contents
-                                for sub_item in item.rglob('*'):
-                                    if sub_item.is_file():
-                                        rel_path = sub_item.relative_to(item)
-                                        dest_file = dest_path / rel_path
-                                        dest_file.parent.mkdir(parents=True, exist_ok=True)
-                                        shutil.copy2(sub_item, dest_file)
-                            else:
-                                shutil.copytree(item, dest_path)
-                        else:
-                            if dest_path.exists() and verbose and not tracker:
-                                console.print(f"[yellow]Overwriting file:[/yellow] {item.name}")
-                            shutil.copy2(item, dest_path)
-                    if verbose and not tracker:
-                        console.print(f"[cyan]Template files merged into current directory[/cyan]")
-            else:
-                # Extract directly to project directory (original behavior)
-                zip_ref.extractall(project_path)
-                
-                # Check what was extracted
-                extracted_items = list(project_path.iterdir())
-                if tracker:
-                    tracker.start("extracted-summary")
-                    tracker.complete("extracted-summary", f"{len(extracted_items)} top-level items")
-                elif verbose:
-                    console.print(f"[cyan]Extracted {len(extracted_items)} items to {project_path}:[/cyan]")
-                    for item in extracted_items:
-                        console.print(f"  - {item.name} ({'dir' if item.is_dir() else 'file'})")
-                
-                # Handle GitHub-style ZIP with a single root directory
-                if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                    # Move contents up one level
-                    nested_dir = extracted_items[0]
-                    temp_move_dir = project_path.parent / f"{project_path.name}_temp"
-                    # Move the nested directory contents to temp location
-                    shutil.move(str(nested_dir), str(temp_move_dir))
-                    # Remove the now-empty project directory
-                    project_path.rmdir()
-                    # Rename temp directory to project directory
-                    shutil.move(str(temp_move_dir), str(project_path))
-                    if tracker:
-                        tracker.add("flatten", "Flatten nested directory")
-                        tracker.complete("flatten")
-                    elif verbose:
-                        console.print(f"[cyan]Flattened nested directory structure[/cyan]")
-                    
-    except Exception as e:
-        if tracker:
-            tracker.error("extract", str(e))
-        else:
-            if verbose:
-                console.print(f"[red]Error extracting template:[/red] {e}")
-        # Clean up project directory if created and not current directory
-        if not is_current_dir and project_path.exists():
-            shutil.rmtree(project_path)
-        raise typer.Exit(1)
-    else:
-        if tracker:
-            tracker.complete("extract")
-    finally:
-        if tracker:
-            tracker.add("cleanup", "Remove temporary archive")
-        # Clean up downloaded ZIP file
-        if zip_path.exists():
-            zip_path.unlink()
-            if tracker:
-                tracker.complete("cleanup")
-            elif verbose:
-                console.print(f"Cleaned up: {zip_path.name}")
-    
-    return project_path
+def _print_cli_warning(
+    phase: str,
+    target_kind: str,
+    target: str | None,
+    exc: BaseException,
+    *,
+    continuing: str | None = None,
+) -> None:
+    """Print a warning that names the failed CLI phase and target."""
+    label = _cli_phase_label(phase, target_kind, target)
+    console.print(f"[yellow]Warning:[/yellow] Failed to {label}: {_cli_error_detail(exc)}")
+    if continuing:
+        console.print(f"[dim]{continuing}[/dim]")
 
 
-@app.command()
-def init(
-    project_name: str = typer.Argument(None, help="Name for your new project directory (optional if using --here)"),
-    ai_assistant: str = typer.Option(None, "--ai", help="AI assistant to use: claude, gemini, or copilot"),
-    ignore_agent_tools: bool = typer.Option(False, "--ignore-agent-tools", help="Skip checks for AI agent tools like Claude Code"),
-    no_git: bool = typer.Option(False, "--no-git", help="Skip git repository initialization"),
-    here: bool = typer.Option(False, "--here", help="Initialize project in the current directory instead of creating a new one"),
-):
-    """
-    Initialize a new Specify project from the latest template.
-    
-    This command will:
-    1. Check that required tools are installed (git is optional)
-    2. Let you choose your AI assistant (Claude Code, Gemini CLI, or GitHub Copilot)
-    3. Download the appropriate template from GitHub
-    4. Extract the template to a new project directory or current directory
-    5. Initialize a fresh git repository (if not --no-git and no existing repo)
-    6. Optionally set up AI assistant commands
-    
-    Examples:
-        specify init my-project
-        specify init my-project --ai claude
-        specify init my-project --ai gemini
-        specify init my-project --ai copilot --no-git
-        specify init --ignore-agent-tools my-project
-        specify init --here --ai claude
-        specify init --here
-    """
-    # Show banner first
-    show_banner()
-    
-    # Validate arguments
-    if here and project_name:
-        console.print("[red]Error:[/red] Cannot specify both project name and --here flag")
-        raise typer.Exit(1)
-    
-    if not here and not project_name:
-        console.print("[red]Error:[/red] Must specify either a project name or use --here flag")
-        raise typer.Exit(1)
-    
-    # Determine project directory
-    if here:
-        project_name = Path.cwd().name
-        project_path = Path.cwd()
-        
-        # Check if current directory has any files
-        existing_items = list(project_path.iterdir())
-        if existing_items:
-            console.print(f"[yellow]Warning:[/yellow] Current directory is not empty ({len(existing_items)} items)")
-            console.print("[yellow]Template files will be merged with existing content and may overwrite existing files[/yellow]")
-            
-            # Ask for confirmation
-            response = typer.confirm("Do you want to continue?")
-            if not response:
-                console.print("[yellow]Operation cancelled[/yellow]")
-                raise typer.Exit(0)
-    else:
-        project_path = Path(project_name).resolve()
-        # Check if project directory already exists
-        if project_path.exists():
-            console.print(f"[red]Error:[/red] Directory '{project_name}' already exists")
-            raise typer.Exit(1)
-    
-    console.print(Panel.fit(
-        "[bold cyan]Specify Project Setup[/bold cyan]\n"
-        f"{'Initializing in current directory:' if here else 'Creating new project:'} [green]{project_path.name}[/green]"
-        + (f"\n[dim]Path: {project_path}[/dim]" if here else ""),
-        border_style="cyan"
-    ))
-    
-    # Check git only if we might need it (not --no-git)
-    git_available = True
-    if not no_git:
-        git_available = check_tool("git", "https://git-scm.com/downloads")
-        if not git_available:
-            console.print("[yellow]Git not found - will skip repository initialization[/yellow]")
+# Constants kept for backward compatibility with presets and extensions.
+DEFAULT_SKILLS_DIR = ".agents/skills"
+SKILL_DESCRIPTIONS = {
+    "specify": "Create or update feature specifications from natural language descriptions.",
+    "plan": "Generate technical implementation plans from feature specifications.",
+    "tasks": "Break down implementation plans into actionable task lists.",
+    "implement": "Execute all tasks from the task breakdown to build the feature.",
+    "converge": "Assess the codebase against spec.md, plan.md, and tasks.md and append remaining work as new tasks.",
+    "analyze": "Perform cross-artifact consistency analysis across spec.md, plan.md, and tasks.md.",
+    "clarify": "Structured clarification workflow for underspecified requirements.",
+    "constitution": "Create or update project governing principles and development guidelines.",
+    "checklist": "Generate custom quality checklists for validating requirements completeness and clarity.",
+    "taskstoissues": "Convert tasks from tasks.md into GitHub issues.",
+}
 
-    # AI assistant selection
-    if ai_assistant:
-        if ai_assistant not in AI_CHOICES:
-            console.print(f"[red]Error:[/red] Invalid AI assistant '{ai_assistant}'. Choose from: {', '.join(AI_CHOICES.keys())}")
-            raise typer.Exit(1)
-        selected_ai = ai_assistant
-    else:
-        # Use arrow-key selection interface
-        selected_ai = select_with_arrows(
-            AI_CHOICES, 
-            "Choose your AI assistant:", 
-            "copilot"
-        )
-    
-    # Check agent tools unless ignored
-    if not ignore_agent_tools:
-        agent_tool_missing = False
-        if selected_ai == "claude":
-            if not check_tool("claude", "Install from: https://docs.anthropic.com/en/docs/claude-code/setup"):
-                console.print("[red]Error:[/red] Claude CLI is required for Claude Code projects")
-                agent_tool_missing = True
-        elif selected_ai == "gemini":
-            if not check_tool("gemini", "Install from: https://github.com/google-gemini/gemini-cli"):
-                console.print("[red]Error:[/red] Gemini CLI is required for Gemini projects")
-                agent_tool_missing = True
-        # GitHub Copilot check is not needed as it's typically available in supported IDEs
-        
-        if agent_tool_missing:
-            console.print("\n[red]Required AI tool is missing![/red]")
-            console.print("[yellow]Tip:[/yellow] Use --ignore-agent-tools to skip this check")
-            raise typer.Exit(1)
-    
-    # Download and set up project
-    # New tree-based progress (no emojis); include earlier substeps
-    tracker = StepTracker("Initialize Specify Project")
-    # Flag to allow suppressing legacy headings
-    sys._specify_tracker_active = True
-    # Pre steps recorded as completed before live rendering
-    tracker.add("precheck", "Check required tools")
-    tracker.complete("precheck", "ok")
-    tracker.add("ai-select", "Select AI assistant")
-    tracker.complete("ai-select", f"{selected_ai}")
-    for key, label in [
-        ("fetch", "Fetch latest release"),
-        ("download", "Download template"),
-        ("extract", "Extract template"),
-        ("zip-list", "Archive contents"),
-        ("extracted-summary", "Extraction summary"),
-        ("cleanup", "Cleanup"),
-        ("git", "Initialize git repository"),
-        ("final", "Finalize")
-    ]:
-        tracker.add(key, label)
 
-    # Use transient so live tree is replaced by the final static render (avoids duplicate output)
-    with Live(tracker.render(), console=console, refresh_per_second=8, transient=True) as live:
-        tracker.attach_refresh(lambda: live.update(tracker.render()))
-        try:
-            download_and_extract_template(project_path, selected_ai, here, verbose=False, tracker=tracker)
-
-            # Git step
-            if not no_git:
-                tracker.start("git")
-                if is_git_repo(project_path):
-                    tracker.complete("git", "existing repo detected")
-                elif git_available:
-                    if init_git_repo(project_path, quiet=True):
-                        tracker.complete("git", "initialized")
-                    else:
-                        tracker.error("git", "init failed")
-                else:
-                    tracker.skip("git", "git not available")
-            else:
-                tracker.skip("git", "--no-git flag")
-
-            tracker.complete("final", "project ready")
-        except Exception as e:
-            tracker.error("final", str(e))
-            if not here and project_path.exists():
-                shutil.rmtree(project_path)
-            raise typer.Exit(1)
-        finally:
-            # Force final render
-            pass
-
-    # Final static tree (ensures finished state visible after Live context ends)
-    console.print(tracker.render())
-    console.print("\n[bold green]Project ready.[/bold green]")
-    
-    # Boxed "Next steps" section
-    steps_lines = []
-    if not here:
-        steps_lines.append(f"1. [bold green]cd {project_name}[/bold green]")
-        step_num = 2
-    else:
-        steps_lines.append("1. You're already in the project directory!")
-        step_num = 2
-
-    if selected_ai == "claude":
-        steps_lines.append(f"{step_num}. Open in Visual Studio Code and start using / commands with Claude Code")
-        steps_lines.append("   - Type / in any file to see available commands")
-        steps_lines.append("   - Use /specify to create specifications")
-        steps_lines.append("   - Use /plan to create implementation plans")
-        steps_lines.append("   - Use /tasks to generate tasks")
-    elif selected_ai == "gemini":
-        steps_lines.append(f"{step_num}. Use / commands with Gemini CLI")
-        steps_lines.append("   - Run gemini /specify to create specifications")
-        steps_lines.append("   - Run gemini /plan to create implementation plans")
-        steps_lines.append("   - See GEMINI.md for all available commands")
-    elif selected_ai == "copilot":
-        steps_lines.append(f"{step_num}. Open in Visual Studio Code and use [bold cyan]/specify[/], [bold cyan]/plan[/], [bold cyan]/tasks[/] commands with GitHub Copilot")
-
-    step_num += 1
-    steps_lines.append(f"{step_num}. Update [bold magenta]CONSTITUTION.md[/bold magenta] with your project's non-negotiable principles")
-
-    steps_panel = Panel("\n".join(steps_lines), title="Next steps", border_style="cyan", padding=(1,2))
-    console.print()  # blank line
-    console.print(steps_panel)
-    
-    # Removed farewell line per user request
+# ===== init command =====
+# Moved to commands/init.py — registered here to preserve CLI surface.
+from .commands import init as _init_cmd  # noqa: E402
+_init_cmd.register(app)
 
 
 @app.command()
 def check():
     """Check that all required tools are installed."""
     show_banner()
-    console.print("[bold]Checking Specify requirements...[/bold]\n")
-    
-    # Check if we have internet connectivity by trying to reach GitHub API
-    console.print("[cyan]Checking internet connectivity...[/cyan]")
-    try:
-        response = httpx.get("https://api.github.com", timeout=5, follow_redirects=True)
-        console.print("[green]✓[/green] Internet connection available")
-    except httpx.RequestError:
-        console.print("[red]✗[/red] No internet connection - required for downloading templates")
-        console.print("[yellow]Please check your internet connection[/yellow]")
-    
-    console.print("\n[cyan]Optional tools:[/cyan]")
-    git_ok = check_tool("git", "https://git-scm.com/downloads")
-    
-    console.print("\n[cyan]Optional AI tools:[/cyan]")
-    claude_ok = check_tool("claude", "Install from: https://docs.anthropic.com/en/docs/claude-code/setup")
-    gemini_ok = check_tool("gemini", "Install from: https://github.com/google-gemini/gemini-cli")
-    
-    console.print("\n[green]✓ Specify CLI is ready to use![/green]")
-    if not git_ok:
-        console.print("[yellow]Consider installing git for repository management[/yellow]")
-    if not (claude_ok or gemini_ok):
-        console.print("[yellow]Consider installing an AI assistant for the best experience[/yellow]")
+    console.print("[bold]Checking for installed tools...[/bold]\n")
 
+    tracker = StepTracker("Check Available Tools")
+
+    agent_results = {}
+    for agent_key, agent_config in AGENT_CONFIG.items():
+        if agent_key == "generic":
+            continue  # Generic is not a real agent to check
+        agent_name = agent_config["name"]
+        requires_cli = agent_config["requires_cli"]
+
+        tracker.add(agent_key, agent_name)
+
+        if requires_cli:
+            agent_results[agent_key] = check_tool(agent_key, tracker=tracker)
+        else:
+            # IDE-based agent - skip CLI check and mark as optional
+            tracker.skip(agent_key, "IDE-based, no CLI check")
+            agent_results[agent_key] = False  # Don't count IDE agents as "found"
+
+    # Check VS Code variants (not in agent config)
+    tracker.add("code", "Visual Studio Code")
+    check_tool("code", tracker=tracker)
+
+    tracker.add("code-insiders", "Visual Studio Code Insiders")
+    check_tool("code-insiders", tracker=tracker)
+
+    console.print(tracker.render())
+
+    console.print("\n[bold green]Specify CLI is ready to use![/bold green]")
+
+    if not any(agent_results.values()):
+        console.print("[dim]Tip: Install a coding agent for the best experience[/dim]")
+
+    console.print("[dim]Tip: Run 'specify self check' to verify you have the latest CLI version[/dim]")
+
+
+def _feature_capabilities() -> dict[str, bool]:
+    """Return stable local CLI capability flags for humans and agents."""
+    return {
+        "controlled_multi_install_integrations": True,
+        "integration_use_command": True,
+        "multi_install_safe_registry_metadata": True,
+        "integration_upgrade_command": True,
+        "self_check_command": True,
+        "workflow_catalog": True,
+        "bundled_templates": True,
+    }
+
+
+@app.command()
+def version(
+    features: bool = typer.Option(
+        False,
+        "--features",
+        help="Show local CLI feature capabilities.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit feature capabilities as JSON. Requires --features.",
+    ),
+):
+    """Display version and system information."""
+    import platform
+
+    cli_version = get_speckit_version()
+
+    if json_output and not features:
+        console.print("[red]Error:[/red] --json requires --features.")
+        raise typer.Exit(1)
+
+    if features:
+        capabilities = _feature_capabilities()
+        if json_output:
+            payload = {"version": cli_version, "features": capabilities}
+            console.print(json.dumps(payload, indent=2))
+            return
+
+        console.print(f"Spec Kit CLI: {cli_version}")
+        console.print()
+        console.print("Features:")
+        for key, enabled in capabilities.items():
+            label = key.replace("_", " ")
+            console.print(f"- {label}: {'yes' if enabled else 'no'}")
+        return
+
+    show_banner()
+
+    info_table = Table(show_header=False, box=None, padding=(0, 2))
+    info_table.add_column("Key", style="cyan", justify="right")
+    info_table.add_column("Value", style="white")
+
+    info_table.add_row("CLI Version", cli_version)
+    info_table.add_row("", "")
+    info_table.add_row("Python", platform.python_version())
+    info_table.add_row("Platform", platform.system())
+    info_table.add_row("Architecture", platform.machine())
+    info_table.add_row("OS Version", platform.version())
+
+    panel = Panel(
+        info_table,
+        title="[bold cyan]Specify CLI Information[/bold cyan]",
+        border_style="cyan",
+        padding=(1, 2)
+    )
+
+    console.print(panel)
+    console.print()
+
+app.add_typer(_self_app, name="self")
+
+
+# ===== Extension Commands =====
+
+# Moved to extensions/_commands.py — registered here to preserve CLI surface.
+from .extensions._commands import register as _register_extension_cmds  # noqa: E402
+_register_extension_cmds(app)
+
+
+# ===== Integration Commands =====
+
+# Moved to integrations/_commands.py — registered here to preserve CLI surface.
+from .integrations._commands import register as _register_integration_cmds  # noqa: E402
+_register_integration_cmds(app)
+
+# Re-export selected helpers to preserve the public import surface.
+from .integrations._helpers import (  # noqa: E402
+    _clear_init_options_for_integration as _clear_init_options_for_integration,
+    _update_init_options_for_integration as _update_init_options_for_integration,
+)
+from ._project import _resolve_init_dir_override as _resolve_init_dir_override  # noqa: E402
+
+
+def _require_specify_project() -> Path:
+    """Return the project root if it is a spec-kit project, else exit.
+
+    Honors the ``SPECIFY_INIT_DIR`` override (same validation rules as the shell
+    scripts) so a member project can be targeted from a monorepo root without
+    ``cd``. This is the resolution chokepoint for *every* project-scoped
+    subcommand — ``integration``, ``extension``, ``workflow``, ``preset``, and the
+    rest that operate on an existing ``.specify/`` project — so the override
+    applies to all of them uniformly. When the override is unset, the project is
+    the current directory, as before.
+    """
+    override = _resolve_init_dir_override()
+    if override is not None:
+        return override
+    project_root = Path.cwd()
+    if (project_root / ".specify").is_dir():
+        return project_root
+    err_console.print("[red]Error:[/red] Not a Spec Kit project (no .specify/ directory)")
+    err_console.print(
+        "Run this command from a Spec Kit project root or set SPECIFY_INIT_DIR to one."
+    )
+    raise typer.Exit(1)
+
+
+# ===== Preset Commands =====
+
+# Moved to presets/_commands.py — registered here to preserve CLI surface.
+from .presets._commands import register as _register_preset_cmds  # noqa: E402
+_register_preset_cmds(app)
+
+
+# ===== Bundle Commands =====
+
+# Bundler subcommand group (specify bundle ...) — see commands/bundle/.
+from .commands.bundle import register as _register_bundle_cmds  # noqa: E402
+_register_bundle_cmds(app)
+
+
+# ===== Workflow Commands =====
+
+# Moved to workflows/_commands.py — registered here to preserve CLI surface.
+from .workflows._commands import register as _register_workflow_cmds  # noqa: E402
+_register_workflow_cmds(app)
+
+# Re-exported at the package root because bundler primitives import these
+# handlers via ``from specify_cli import workflow_*`` (and tests monkeypatch
+# ``specify_cli.workflow_add``). Keep these names resolvable from the root.
+from .workflows._commands import (  # noqa: E402,F401
+    workflow_add,
+    workflow_remove,
+    workflow_step_add,
+    workflow_step_remove,
+)
 
 def main():
+    # On Windows the default stdout/stderr code page (e.g. cp1252) cannot encode
+    # the Rich banner and box-drawing glyphs, so the CLI crashes with
+    # UnicodeEncodeError whenever output is not a UTF-8 TTY (piped, redirected to
+    # a file, or running under a legacy code page). Force UTF-8 with graceful
+    # replacement so output degrades instead of aborting. No-op on POSIX.
+    if sys.platform == "win32":
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError, OSError):
+                pass
     app()
-
 
 if __name__ == "__main__":
     main()
